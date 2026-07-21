@@ -1,8 +1,21 @@
+import threading
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from src.analyzer import GeminiAnalyzer, _AllModelsFailedError
+
+
+def test_analyzer_initializes_quota_circuit_lock() -> None:
+    def _fake_init_litellm(analyzer: GeminiAnalyzer) -> None:
+        analyzer._litellm_available = True
+
+    with patch.object(GeminiAnalyzer, "_init_litellm", _fake_init_litellm):
+        analyzer = GeminiAnalyzer(config=SimpleNamespace())
+
+    assert isinstance(analyzer._quota_circuit_lock, type(threading.Lock()))
+    assert analyzer._quota_circuit_provider is None
 
 
 def _analyzer_without_init() -> GeminiAnalyzer:
