@@ -2286,6 +2286,8 @@ class GeminiAnalyzer:
         self._router = None
         self._legacy_router_model_list: List[Dict[str, Any]] = []
         self._litellm_available = False
+        self._quota_circuit_lock = threading.Lock()
+        self._quota_circuit_provider: Optional[str] = None
         self._init_litellm()
         if not self._litellm_available:
             try:
@@ -2304,6 +2306,59 @@ class GeminiAnalyzer:
     def _get_runtime_config(self) -> Config:
         """Return the runtime config, honoring injected overrides for tests/pipeline."""
         return getattr(self, "_config_override", None) or get_config()
+
+    @staticmethod
+    def _is_hard_quota_exhaustion(error: Any) -> bool:
+        """Return whether an error proves quota/billing exhaustion, not a transient 429."""
+        text = str(error or "").lower()
+        return any(
+            marker in text
+            for marker in (
+                "exceeded your current quota",
+                "insufficient_quota",
+                "quota_exceeded",
+                "resource_exhausted",
+                "billing quota",
+                "billing details",
+                "account balance insufficient",
+            )
+        )
+
+    def _open_quota_circuit_if_safe(
+        self,
+        *,
+        models: List[str],
+        model_list: List[Dict[str, Any]],
+        error: Any,
+    ) -> None:
+        """Open the run-local circuit only when every attempted model shares one provider."""
+        if not models or not self._is_hard_quota_exhaustion(error):
+            return
+        providers = {
+            resolved_model_provider_identity(model, model_list)[1]
+            for model in models
+        }
+        providers.discard(None)
+        providers.discard("")
+        if len(providers) != 1:
+            return
+        provider = next(iter(providers))
+        with self._quota_circuit_lock:
+            if self._quota_circuit_provider is None:
+                self._quota_circuit_provider = provider
+                logger.error(
+                    "[LLM] %s quota exhausted; opening run-local circuit and skipping "
+                    "remaining API calls. Configure quota or a different-provider fallback.",
+                    provider,
+                )
+
+    def _raise_if_quota_circuit_open(self) -> None:
+        with self._quota_circuit_lock:
+            provider = self._quota_circuit_provider
+        if provider:
+            raise _AllModelsFailedError(
+                f"LLM quota circuit open for provider {provider}; API call skipped"
+            )
 
     def _get_skill_prompt_sections(self) -> tuple[str, str, bool]:
         """Resolve skill instructions + default baseline + prompt mode."""
@@ -3105,6 +3160,7 @@ class GeminiAnalyzer:
             name and usage is a dict with prompt_tokens, completion_tokens, total_tokens.
         """
         config = self._get_runtime_config()
+        self._raise_if_quota_circuit_open()
         max_tokens = (
             generation_config.get('max_output_tokens')
             or generation_config.get('max_tokens')
@@ -3303,6 +3359,11 @@ class GeminiAnalyzer:
                 last_error = RuntimeError(f"{type(e).__name__}: {safe_error}")
                 continue
 
+        self._open_quota_circuit_if_safe(
+            models=models_to_try,
+            model_list=config.llm_model_list,
+            error=last_error,
+        )
         raise _AllModelsFailedError(
             f"All LLM models failed (tried {len(models_to_try)} model(s)). Last error: {last_error}",
             last_response_text=last_response_text,

@@ -322,6 +322,7 @@ def _has_configured_hotspot_news_source(config: Config) -> bool:
         "serpapi_api_keys",
         "minimax_api_keys",
         "searxng_base_urls",
+        "gdelt_search_enabled",
     )
     return any(bool(getattr(config, field, None)) for field in fields)
 
@@ -342,6 +343,7 @@ def _build_hotspot_event_routes_from_search(topic: str, config: Config) -> List[
             minimax_keys=getattr(config, "minimax_api_keys", None),
             searxng_base_urls=getattr(config, "searxng_base_urls", None),
             searxng_public_instances_enabled=False,
+            gdelt_search_enabled=bool(getattr(config, "gdelt_search_enabled", False)),
             news_max_age_days=int(getattr(config, "news_max_age_days", 3) or 3),
             news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
         )

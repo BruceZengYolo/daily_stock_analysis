@@ -154,6 +154,142 @@ class SearchResponse:
         return "\n".join(lines)
 
 
+class GDELTSearchProvider:
+    """No-key fallback backed by the public GDELT DOC 2.0 API.
+
+    GDELT is intentionally last in provider order. Its public endpoint asks
+    callers to stay below one request per five seconds, so this provider uses
+    a process-wide six-second gate and a five-minute cooldown after HTTP 429.
+    """
+
+    API_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
+    MIN_INTERVAL_SECONDS = 6.0
+    RATE_LIMIT_COOLDOWN_SECONDS = 300.0
+    _request_lock = threading.Lock()
+    _next_request_at = 0.0
+
+    def __init__(self, enabled: bool = False):
+        self._enabled = bool(enabled)
+        self._blocked_until = 0.0
+
+    @property
+    def name(self) -> str:
+        return "GDELT"
+
+    @property
+    def is_available(self) -> bool:
+        return self._enabled
+
+    @staticmethod
+    def _published_date(raw: Any) -> Optional[str]:
+        value = str(raw or "").strip()
+        for fmt in ("%Y%m%dT%H%M%SZ", "%Y%m%d%H%M%S"):
+            try:
+                return datetime.strptime(value, fmt).date().isoformat()
+            except ValueError:
+                continue
+        return None
+
+    def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
+        started = time.time()
+        if not self._enabled:
+            return SearchResponse(query=query, results=[], provider=self.name, success=False, error_message="GDELT disabled")
+        if time.monotonic() < self._blocked_until:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message="GDELT rate-limit cooldown active",
+                search_time=time.time() - started,
+            )
+
+        with self._request_lock:
+            wait_seconds = max(0.0, type(self)._next_request_at - time.monotonic())
+            if wait_seconds:
+                time.sleep(wait_seconds)
+            type(self)._next_request_at = time.monotonic() + self.MIN_INTERVAL_SECONDS
+            try:
+                response = requests.get(
+                    self.API_URL,
+                    params={
+                        "query": query,
+                        "mode": "artlist",
+                        "format": "json",
+                        "maxrecords": max(1, min(int(max_results), 50)),
+                        "timespan": f"{max(1, min(int(days), 90))}d",
+                        "sort": "HybridRel",
+                    },
+                    headers={"User-Agent": "daily-stock-analysis/1.0"},
+                    timeout=12,
+                )
+            except requests.exceptions.RequestException as exc:
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self.name,
+                    success=False,
+                    error_message=f"network request failed: {exc}",
+                    search_time=time.time() - started,
+                )
+
+        if response.status_code == 429:
+            self._blocked_until = time.monotonic() + self.RATE_LIMIT_COOLDOWN_SECONDS
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message="HTTP 429; cooldown opened for 300 seconds",
+                search_time=time.time() - started,
+            )
+        if response.status_code != 200:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=f"HTTP {response.status_code}",
+                search_time=time.time() - started,
+            )
+        try:
+            payload = response.json()
+        except ValueError:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message="invalid JSON response",
+                search_time=time.time() - started,
+            )
+
+        results: List[SearchResult] = []
+        for article in payload.get("articles") or []:
+            if not isinstance(article, dict):
+                continue
+            title = str(article.get("title") or "").strip()
+            url = str(article.get("url") or "").strip()
+            if not title or not url:
+                continue
+            results.append(
+                SearchResult(
+                    title=title,
+                    snippet=title,
+                    url=url,
+                    source=str(article.get("domain") or "GDELT"),
+                    published_date=self._published_date(article.get("seendate")),
+                )
+            )
+        return SearchResponse(
+            query=query,
+            results=results,
+            provider=self.name,
+            success=True,
+            search_time=time.time() - started,
+        )
+
+
 class BaseSearchProvider(ABC):
     """搜索引擎基类"""
     
@@ -2265,6 +2401,7 @@ class SearchService:
         minimax_keys: Optional[List[str]] = None,
         searxng_base_urls: Optional[List[str]] = None,
         searxng_public_instances_enabled: bool = True,
+        gdelt_search_enabled: bool = False,
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
     ):
@@ -2280,6 +2417,7 @@ class SearchService:
             minimax_keys: MiniMax API Key 列表
             searxng_base_urls: SearXNG 实例地址列表（自建无配额兜底）
             searxng_public_instances_enabled: 未配置自建实例时，是否自动使用公共 SearXNG 实例
+            gdelt_search_enabled: 是否启用无需 API Key 的 GDELT DOC API 末级兜底
             news_max_age_days: 新闻最大时效（天）
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
         """
@@ -2338,6 +2476,12 @@ class SearchService:
                 logger.info("已配置 SearXNG 搜索，共 %s 个自建实例", len(searxng_base_urls))
             else:
                 logger.info("已启用 SearXNG 公共实例自动发现模式")
+
+        # Public, no-key fallback. Kept after configured providers and SearXNG.
+        gdelt_provider = GDELTSearchProvider(enabled=gdelt_search_enabled)
+        if gdelt_provider.is_available:
+            self._providers.append(gdelt_provider)
+            logger.info("已启用 GDELT 公共新闻搜索（末级兜底，带全局限速）")
 
         # 7. Anspire Search（实时智能搜索优化）
         if anspire_keys:
@@ -4455,6 +4599,7 @@ def get_search_service() -> SearchService:
                     minimax_keys=config.minimax_api_keys,
                     searxng_base_urls=config.searxng_base_urls,
                     searxng_public_instances_enabled=config.searxng_public_instances_enabled,
+                    gdelt_search_enabled=getattr(config, "gdelt_search_enabled", False),
                     news_max_age_days=config.news_max_age_days,
                     news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
                 )

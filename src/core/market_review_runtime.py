@@ -105,6 +105,7 @@ def build_market_review_runtime(
                 "searxng_public_instances_enabled",
                 True,
             ),
+            gdelt_search_enabled=getattr(config, "gdelt_search_enabled", False),
             news_max_age_days=getattr(config, "news_max_age_days", 3),
             news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
         )
